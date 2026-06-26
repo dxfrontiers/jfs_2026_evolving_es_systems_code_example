@@ -1,89 +1,196 @@
-# OpenCQRS – Sample Applications
-<!-- BADGES_START -->
-[![Java](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fopen-cqrs%2Fopencqrs%2Frefs%2Fheads%2Fgh-pages%2Fbadges%2Fjdk.json)](https://openjdk.org)
-[![EventSourcingDB](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fopen-cqrs%2Fopencqrs%2Frefs%2Fheads%2Fgh-pages%2Fbadges%2Fesdb.json)](https://www.eventsourcingdb.io)
-[![Spring Boot](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fopen-cqrs%2Fopencqrs%2Frefs%2Fheads%2Fgh-pages%2Fbadges%2Fspring.json)](https://spring.io/projects/spring-boot)
-<!-- BADGES_END -->
+# Schema Evolution: Upcasters and Lazy Enrichment
 
-![OpenCQRS](banner.png)
+-----
 
+**NOTE**
 
-This repository contains a collection of sample applications. Each sample demonstrates how to implement a specific use case commonly encountered when developing software with the [OpenCQRS framework](https://www.opencqrs.com).
+This sample assumes you have completed the official [OpenCQRS tutorial](https://docs.opencqrs.com/tutorials/).
 
+Companion reading: [Evolving Event-Sourced Systems](https://docs.opencqrs.com/blog/evolving-event-sourced-systems/) on the OpenCQRS blog.
 
-## About OpenCQRS and EventSourcingDB
+-----
 
-### OpenCQRS
+Events in an event-sourced system are immutable. When a new requirement demands a field that did not exist when older events were written, you cannot rewrite history. There are three strategies for handling this — and they form a decision tree:
 
-[**OpenCQRS**](https://www.opencqrs.com) is an innovative, opinionated and light-weight framework for the developing applications based on **CQRS (Command Query Responsibility Segregation)** and **Event Sourcing**.  
+```
+Can the missing data be derived from existing fields?
+├── Yes → Calculate via Upcaster
+└── No → Does a meaningful default exist?
+         ├── Yes → Compensate via Upcaster
+         └── No  → Enrich Lazily
+```
 
-It provides the means to implement modern architecture patterns like hexagonal architecturs quite easily and with comprehensive sample apps that allow first experiments with CQRS/ES in a matter of minutes.
+This sample demonstrates all three on the same domain — the loan-application service. One event (`LoanApplicationAppliedEvent`) has grown over time, and each new field uses a different strategy:
 
-### EventSourcingDB
+| Field | When added | Strategy | Where it lives |
+|---|---|---|---|
+| `verifiedAddress` (boolean) | v2 | **Calculate** | [`VerifiedAddressUpcaster`](src/main/java/com/example/cqrs/domain/LoanApplication/upcasters/VerifiedAddressUpcaster.java) — derives from `locationType` |
+| `currency` (String) | v3 | **Compensate** | [`CurrencyDefaultUpcaster`](src/main/java/com/example/cqrs/domain/LoanApplication/upcasters/CurrencyDefaultUpcaster.java) — defaults to `"EUR"` |
+| `manualReviewResult` (String) | v4 | **Enrich Lazily** | [`LoanApplicationHandling.handle(ApproveLoanCommand, …)`](src/main/java/com/example/cqrs/domain/LoanApplication/LoanApplicationHandling.java) |
 
-[**EventSourcingDB**](https://www.eventsourcingdb.io) is the database that adapts to your business processes like never before. It captures the semantics of your domain events and builds the perfect foundation for your event-driven architecture to take your business to the next level.
+The first two strategies sit on the **read path**: a pure-function transformation between the store and the application. The third sits on the **write path**: an extra event appended to the entity's stream the first time the entity is touched after the schema change. The hierarchy matters — try Calculate first, then Compensate, only then Enrich.
 
-## Event Sourcing explained
+## Strategy 1 — Calculate via Upcaster
 
-Event Sourcing is a powerful architectural pattern that records all changes to an application's state as a sequence of immutable events, rather than storing just the current state. This approach provides a complete and auditable history, allowing for reconstruction of past states and enabling complex analytical insights.
+When the missing data can be derived from fields already in the event, an upcaster fills the gap at read time. The event in the store is never touched; the application sees a payload that looks like it was written with the current schema.
 
-### How Event Sourcing Works
+[`VerifiedAddressUpcaster`](src/main/java/com/example/cqrs/domain/LoanApplication/upcasters/VerifiedAddressUpcaster.java):
 
-![Event Sourcing Animation](es-animation.gif)
+```java
+public class VerifiedAddressUpcaster extends AbstractEventDataMarshallingEventUpcaster {
 
-Let's break down the typical flow of an event-sourced system:
+    @Override
+    public boolean canUpcast(Event event) {
+        if (!event.type().equals(LoanApplicationAppliedEvent.class.getName())) return false;
+        Object payload = event.data().get("payload");
+        return payload instanceof Map<?, ?> p && !p.containsKey("verifiedAddress");
+    }
 
-1. **Command Handling:** It all starts when your application receives a command. This is a request to do something, like "Place Order" or "Add Item to Cart."
-2. **Load Domain Model (Aggregate):** The system then loads the relevant domain model object (often called an Aggregate). This object represents the current "version" of the entity the command is acting on.
+    @Override
+    protected Stream<MetaDataAndPayloadResult> doUpcast(Event event, Map<String, ?> metaData, Map<String, ?> payload) {
+        Map<String, Object> upcasted = new HashMap<>(payload);
+        upcasted.put("verifiedAddress", "IN_PERSON".equals(payload.get("locationType")));
+        return Stream.of(new MetaDataAndPayloadResult(event.type(), metaData, upcasted));
+    }
+}
+```
 
-3. **Query the Event Store:** To load the Aggregate, the system queries the Event Store. This specialized database holds all the historical events for that particular Aggregate.
+`canUpcast` is the cheap gate that runs against every event; `doUpcast` only fires for events that genuinely need transformation. The result is the new payload shape — `LoanApplicationAppliedEvent` can have `verifiedAddress` as a required field, and the upcaster guarantees no old event reaches the application without it.
 
-4. **Rebuild State from Events:** The Aggregate then rebuilds its current state by replaying all its past events from the Event Store, in chronological order. This ensures the Aggregate has the full context before processing the new command.
+## Strategy 2 — Compensate via Upcaster
 
-5. **Validate the Command:** Now, with its state fully reconstructed, the Aggregate can validate the incoming command against its current business rules. For example, if you're trying to add an item to a cart, it might check if the item is in stock.
+When the new field cannot be derived but a meaningful default exists, a compensating upcaster supplies it. Same mechanism, different intent.
 
-6. **Publish New Event(s):** If the command is valid, the Aggregate generates one or more new events that describe what just happened (e.g., "Order Placed Event," "Item Added to Cart Event"). These new events are then appended to the Aggregate's stream in the Event Store, becoming part of the immutable history.
+[`CurrencyDefaultUpcaster`](src/main/java/com/example/cqrs/domain/LoanApplication/upcasters/CurrencyDefaultUpcaster.java):
 
-This systematic approach ensures data integrity, simplifies auditing, and opens up possibilities for powerful features like "time travel debugging" and sophisticated business intelligence.
+```java
+@Override
+protected Stream<MetaDataAndPayloadResult> doUpcast(Event event, Map<String, ?> metaData, Map<String, ?> payload) {
+    Map<String, Object> upcasted = new HashMap<>(payload);
+    upcasted.put("currency", "EUR");
+    return Stream.of(new MetaDataAndPayloadResult(event.type(), metaData, upcasted));
+}
+```
 
-## Why OpenCQRS?
+The choice of `"EUR"` reflects historical reality: at the time the older events were written, the business operated in a single currency. The default is a faithful reconstruction, not a guess.
 
-We’ve worked with CQRS and Event Sourcing for years – and none of the existing Java frameworks gave us what we needed:
+## Strategy 3 — Enrich Lazily
 
-    They were either too heavy, too leaky in abstraction, or lacked clear guidance for beginners.
+When neither Calculate nor Compensate works — there is no derivable source and no meaningful default — the missing data has to be obtained at runtime and persisted as a new event. The first time an entity is touched after the schema change, the handler notices the field is empty, fetches the value, and appends both the enrichment event and the business event in **one** atomic transaction.
 
-    When EventSourcingDB emerged, we finally had the foundation we needed to build the framework we always wished had existed.
+[`LoanApplicationHandling.handle(ApproveLoanCommand, …)`](src/main/java/com/example/cqrs/domain/LoanApplication/LoanApplicationHandling.java):
 
-OpenCQRS is that framework.
-Simple enough to get started in minutes. Powerful enough to grow with your system.
+```java
+@CommandHandling
+public void handle(
+        LoanRequest request,
+        ApproveLoanCommand command,
+        CommandEventPublisher<LoanRequest> publisher,
+        @Autowired ManualReviewService manualReviewService) {
 
-## Included Samples
+    String reviewResult = request.manualReviewResult();
+    if (reviewResult == null) {
+        reviewResult = manualReviewService.fetchReviewResult(command.getApplicationId());
+        publisher.publish(new LoanApplicationEnrichedEvent(command.getApplicationId(), reviewResult));
+    }
 
-The following scenarios are covered:
+    if (!"COMPLIANT".equals(reviewResult)) {
+        throw new IllegalStateException("Loan cannot be approved, review result: " + reviewResult);
+    }
+    publisher.publish(new LoanApplicationApprovedEvent(command.getApplicationId()));
+}
+```
 
-- **Filtering Event Streams**  
-  Demonstrates how to tag events to efficiently filter the event stream.  
-  → [View sample](./filtering-event-streams)
+Both `publish(…)` calls share one handler invocation and land in ESDB as one append. This delivers three properties that a `CommandRouter`-wrapping gateway with two `send(…)` calls cannot:
 
-- **Subscribing to Queriess**  
-  Shows how to wait for read-side projections to reflect the outcome of a command using polling or reactive subscriptions.  
-  → [View sample](./subscription-queries)
+- **Atomic** — the enrichment and approval commit together or neither does.
+- **OL-compatible** — a `SubjectIsOnEventId` precondition on the incoming command is honoured against the sourced version.
+- **Idempotent on retry** — the `if (null)` check against the sourced state guards repeats.
 
-- **Implementing Sagas**  
-  Explains how to coordinate workflows across long-running, multi-system transactions are known as **Sagas**.  
-  → [View sample](./implementing-sagas)
+The `ManualReviewService` is the seam to the real-world source — a REST client, gRPC, queue subscription, or human-review system. The [stub](src/main/java/com/example/cqrs/domain/LoanApplication/StubManualReviewService.java) returns `"COMPLIANT"` so the sample is reproducible.
 
-Each sample application can be run locally via `docker-compose` (see the corresponding `docker-compose.yml` files). Interaction is possible using the included Postman and Bruno API collections.
+## How the upcasters are wired
 
-Refer to each app’s individual `README.md` for detailed instructions.
+Each upcaster is registered as a Spring `@Bean EventUpcaster` in [`OpenCqrsConfig`](src/main/java/com/example/cqrs/configuration/OpenCqrsConfig.java):
 
+```java
+@Configuration
+public class OpenCqrsConfig {
+    @Bean public EventUpcaster verifiedAddressUpcaster(EventDataMarshaller m) { return new VerifiedAddressUpcaster(m); }
+    @Bean public EventUpcaster currencyDefaultUpcaster(EventDataMarshaller m) { return new CurrencyDefaultUpcaster(m); }
+}
+```
 
-## Requirements
+OpenCQRS's `EventUpcasterAutoConfiguration` picks up `List<EventUpcaster>` from the context and chains them. Every event read from ESDB passes through `canUpcast`/`upcast` for each registered upcaster — events that are already current short-circuit at `canUpcast == false`, while legacy events get transformed in sequence before they reach the deserializer.
 
-To run the samples locally, ensure the following tools are installed:
+## Commands, events and state
 
-- Java 21+
-- Docker
-- Docker Compose
+| Type | Role |
+|---|---|
+| [`ApplyLoanRequestCommand`](src/main/java/com/example/cqrs/domain/LoanApplication/commands/ApplyLoanRequestCommand.java) | `SubjectCondition.PRISTINE` — produces `LoanApplicationAppliedEvent` with all fields populated by the current schema |
+| [`ApproveLoanCommand`](src/main/java/com/example/cqrs/domain/LoanApplication/commands/ApproveLoanCommand.java) | `SubjectCondition.EXISTS` — handled by the single-handler enricher |
+| [`LoanApplicationAppliedEvent`](src/main/java/com/example/cqrs/domain/LoanApplication/events/LoanApplicationAppliedEvent.java) | The event that grew over time; carries `applicationId`, `applicant`, `amount`, `currency`, `locationType`, `verifiedAddress` |
+| [`LoanApplicationEnrichedEvent`](src/main/java/com/example/cqrs/domain/LoanApplication/events/LoanApplicationEnrichedEvent.java) | Written by lazy enrichment; carries `applicationId`, `manualReviewResult` |
+| [`LoanApplicationApprovedEvent`](src/main/java/com/example/cqrs/domain/LoanApplication/events/LoanApplicationApprovedEvent.java) | Written by the approve handler |
+| [`LoanRequest`](src/main/java/com/example/cqrs/domain/LoanApplication/LoanRequest.java) | Sourced aggregate state — `manualReviewResult` is `null` until the lazy-enrichment branch fires |
 
-> ℹ️ *EventSourcingDB runs as a container via the provided `docker-compose.yml` files.*
+## Why not a gateway that sends two commands
+
+A tempting alternative for the third strategy is to wrap `CommandRouter` in a "gateway" that intercepts incoming commands, dispatches an `EnsureLoanEnrichmentCommand` first, then forwards the original. That construction looks elegant but has three structural defects on the command side:
+
+1. **No transaction over the two `send(…)` calls.** If the second send throws, the enrichment is permanent without the approval.
+2. **Breaks `SubjectIsOnEventId` optimistic locking.** The gateway appends an event between client-`send` and business handler, moving the subject's tip from version `X` to `Y`. The client's precondition fails.
+3. **Idempotency only half-solved.** The enrichment is no-op on replay, but the business command is re-dispatched on retry and needs its own state-based guard.
+
+The single-handler enricher removes all three: one append, one transaction, one precondition check.
+
+## When this is *not* enough
+
+Upcasters and single-handler enrichment work because they live on the read path or inside one atomic append. As soon as the enrichment crosses subjects, takes long enough to be asynchronous, or has its own intermediate state, you outgrow these patterns:
+
+- **Cross-aggregate enrichment** — the enrichment writes to one subject, the business effect to another. No shared atomic append.
+- **Asynchronous or long-running enrichment** — external systems that take seconds, retries, human-in-the-loop steps.
+- **Multi-step enrichment with intermediate state** — the enrichment itself is a process, not a single decision.
+
+For these, reach for a **Saga** (see the [`implementing-sagas`](../implementing-sagas/) sample). Sagas are designed for orchestrating multiple writes across aggregates with explicit retry, compensation and status tracking — the things an in-handler enricher cannot give you.
+
+## A note on consistency
+
+In OpenCQRS, sourcing reads an entity's full event stream from the store, and writes are committed before `commandRouter.send(…)` returns. **Within a single subject, this is strongly consistent** — after a successful send, the next sourcing on that subject sees the just-written events. Eventual consistency in OpenCQRS applies to projections (read models like `LoanApplicationView`) and to cross-subject reads, not to follow-up command sourcing on the same subject. The single-handler enricher exploits this guarantee directly.
+
+## Running the sample
+
+```bash
+docker-compose up -d           # ESDB + Postgres
+./gradlew bootRun
+```
+
+```bash
+# 1. Apply for a loan (new payload — all fields supplied)
+curl -X POST http://localhost:8080/api/loan \
+     -H 'Content-Type: application/json' \
+     -d '{"applicant":"Alice","amount":"10000","currency":"EUR","locationType":"IN_PERSON"}'
+# → returns the new applicationId
+
+# 2. Approve it — triggers lazy enrichment + approval in one transaction
+curl -X POST http://localhost:8080/api/loan/approve \
+     -H 'Content-Type: application/json' \
+     -d '{"applicationId":"<id-from-step-1>"}'
+
+# 3. Inspect the read model — verifiedAddress / currency / manualReviewResult all present
+curl http://localhost:8080/api/loan/<id-from-step-1>
+```
+
+If `currency` or `locationType` are omitted in the apply request, the controller defaults them (`"EUR"` / `"POSTAL"`) — the apply path produces complete events going forward. The upcasters exist for events written before those fields existed in the schema.
+
+## Tests
+
+[`LoanApplicationHandlingTest`](src/test/java/com/example/cqrs/domain/LoanApplication/LoanApplicationHandlingTest.java) covers the command-handling pipeline with `@CommandHandlingTest` and a `@MockitoBean` for `ManualReviewService`:
+
+- new apply produces the full Applied event,
+- duplicate apply on existing subject is rejected,
+- approve on a not-yet-enriched entity emits **both** enrich and approve events in one append,
+- approve on an already-enriched entity emits only the approve event,
+- non-`COMPLIANT` review result raises `IllegalStateException`.
+
+[`VerifiedAddressUpcasterTest`](src/test/java/com/example/cqrs/domain/LoanApplication/upcasters/VerifiedAddressUpcasterTest.java) and [`CurrencyDefaultUpcasterTest`](src/test/java/com/example/cqrs/domain/LoanApplication/upcasters/CurrencyDefaultUpcasterTest.java) exercise each upcaster as a pure function over raw `Event`s — proving `canUpcast` and `doUpcast` behaviour without spinning up the framework.
